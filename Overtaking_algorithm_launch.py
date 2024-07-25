@@ -6,10 +6,16 @@ import numpy as np
 import pandas as pd
 from std_msgs.msg import Float64
 from planning import overtake_traj_planner
+from utils import racing_env, base
 from tf.transformations import euler_from_quaternion
 import time
-from msg import VehicleState
+from racing import offboard
+from car_racing.msg import VehicleState
+from pathos.multiprocessing import ProcessingPool as Pool
 import math
+from cvxopt.solvers import qp
+from control import control, lmpc_helper
+from cvxopt import spmatrix, matrix, solvers
 
 class Overtaking_algorithm():
     def __init__(self):
@@ -19,7 +25,7 @@ class Overtaking_algorithm():
         self.current_pose_sub=rospy.Subscriber('/current_pose',PoseStamped, self.current_pose_callback)
         self.current_velocity=rospy.Subscriber('/current_velocity', TwistStamped, self.current_velocity_callback)
         self.target_angular=rospy.Subscriber('/target_angular',Float64, self.target_angular_callback)
-        file_path = '~/Desktop/car-racing/local_coordinates_tags.csv' 
+        file_path = '~/car-racing/local_coordinates_tags.csv' 
     #  target course
         df = pd.read_csv(file_path)
         lat_list = list(zip(df['local_x']))
@@ -30,35 +36,143 @@ class Overtaking_algorithm():
         self.old_direction_flag=None
         self.time=0.0
         self.x=[0]*6
+        self.timestep=0.1
+        self.iter=0
+        self.p=Pool(4)
+        self.lmpc_param=10
+        self.u_ss=None
+        self.ss_xcurv=None
+        self.lin_input=None
+        self.lin_points=None
+        self.time_ss=np.ones(1).astype(int)
+        timestep=0.1
+        X_DIM=6
+        U_DIM=2
+        ego = offboard.DynamicBicycleModel(name="ego", param=base.CarParam(edgecolor="black"), system_param = base.SystemParam())
+        ego.set_timestep(timestep)
+    # run the pid controller for the first lap to collect data
+        pid_controller = offboard.PIDTracking(vt=0.7, eyt=0.0)
+        pid_controller.set_timestep(timestep)
+        ego.set_ctrl_policy(pid_controller)
+        pid_controller.set_track(track)
+        ego.set_state_curvilinear(np.zeros((X_DIM,)))
+        ego.set_state_global(np.zeros((X_DIM,)))
+        ego.start_logging()
+        ego.set_track(track)
+    # run mpc-lti controller for the second lap to collect data
+        mpc_lti_param = base.MPCTrackingParam(vt=0.7, eyt=0.0)
+        mpc_lti_controller = offboard.MPCTracking(mpc_lti_param, ego.system_param)
+        mpc_lti_controller.set_timestep(timestep)
+        mpc_lti_controller.set_track(track)
         self.vehicles_interest={"ego":VehicleState(), "vehicle_1":VehicleState()}
         rate = rospy.Rate(1000)
         self.waypoint=[]
+        track_spec = np.genfromtxt(file_path, delimiter=',', names=True)
+        track = racing_env.ClosedTrack(track_spec, track_width=0.8)
+        self.set_track(track)
         for i in lat_list:
             cx.append(i[0])
         for j in lon_list:
             cy.append(j[0])
         for k in range(len(cx)):
             self.waypoint.append([cx[k],cy[k]])
+        self.matrix_Atv, self.matrix_Btv, self.matrix_Ctv, _ = self.estimate_ABC()
         while not rospy.is_shutdown():
             rate.sleep()
-            # (overtake_traj_xcurv,
-            #         overtake_traj_xglob,
-            #         direction_flag,
-            #         sorted_vehicles,
-            #         bezier_xglob,
-            #         solve_time,
-            #         all_bezier_xglob,
-            #         all_traj_xglob)=overtake_traj_planner.OvertakeTrajPlanner.get_local_traj(
-            #         self.x,
-            #         self.time,
-            #         self.vehicles_interest,
-            #         self.matrix_Atv,
-            #         self.matrix_Btv,
-            #         self.matrix_Ctv,
-            #         self.old_ey,
-            #         self.old_direction_flag,)
-            # self.old_ey = overtake_traj_xcurv[-1, 5]
-            # self.old_direction_flag = direction_flag
+            (overtake_traj_xcurv,
+                    overtake_traj_xglob,
+                    direction_flag,
+                    sorted_vehicles,
+                    bezier_xglob,
+                    solve_time,
+                    all_bezier_xglob,
+                    all_traj_xglob)=overtake_traj_planner.OvertakeTrajPlanner.get_local_traj(
+                    self.x,
+                    self.time,
+                    self.vehicles_interest,
+                    self.matrix_Atv,
+                    self.matrix_Btv,
+                    self.matrix_Ctv,
+                    self.old_ey,
+                    self.old_direction_flag,)
+            self.old_ey = overtake_traj_xcurv[-1, 5]
+            self.old_direction_flag = direction_flag
+            ego.ctrl_policy.add_trajectory(
+                            ego,
+                            2,
+                        )
+            print(overtake_traj_xcurv)
+    def add_trajectory(self, ego, lap_number):
+
+        iter = self.iter
+        end_iter = int(round((ego.times[lap_number][-1] - ego.times[lap_number][0]) / ego.timestep))
+        times = np.stack(ego.times[lap_number], axis=0)
+        self.time_ss[iter] = end_iter
+        xcurvs = np.stack(ego.xcurvs[lap_number], axis=0)
+        self.ss_xcurv[0 : (end_iter + 1), :, iter] = xcurvs[0 : (end_iter + 1), :]
+        xglobs = np.stack(ego.xglobs[lap_number], axis=0)
+        self.ss_glob[0 : (end_iter + 1), :, iter] = xglobs[0 : (end_iter + 1), :]
+        inputs = np.stack(ego.inputs[lap_number], axis=0)
+        self.u_ss[0:end_iter, :, iter] = inputs[0:end_iter, :]
+        self.Qfun[0 : (end_iter + 1), iter] = lmpc_helper.compute_cost(
+            xcurvs[0 : (end_iter + 1), :],
+            inputs[0:(end_iter), :],
+            self.lap_length,
+        )
+        for i in np.arange(0, self.Qfun.shape[0]):
+            if self.Qfun[i, iter] == 0:
+                self.Qfun[i, iter] = self.Qfun[i - 1, iter] - 1
+        if self.iter == 0:
+            self.lin_points = self.ss_xcurv[1 : self.lmpc_param.num_horizon + 2, :, iter]
+            self.lin_input = self.u_ss[1 : self.lmpc_param.num_horizon + 1, :, iter]
+        self.iter = self.iter + 1
+        self.time_in_iter = 0
+            
+    def estimate_ABC(self):
+        lin_points = self.lin_points
+        lin_input = self.lin_input
+        num_horizon = self.lmpc_param
+        ss_xcurv = self.ss_xcurv
+        u_ss = self.u_ss
+        time_ss = self.time_ss
+        point_and_tangent = self.point_and_tangent
+        timestep = self.timestep
+        iter = self.iter
+        p = self.p
+        Atv = []
+        Btv = []
+        Ctv = []
+        index_used_list = []
+        lap_used_for_linearization = 2
+        used_iter = range(iter - lap_used_for_linearization, iter)
+        max_num_point = 40
+        for i in range(0, num_horizon):
+            (Ai, Bi, Ci, index_selected,) = lmpc_helper.regression_and_linearization(
+                lin_points,
+                lin_input,
+                used_iter,
+                ss_xcurv,
+                u_ss,
+                time_ss,
+                max_num_point,
+                qp,
+                matrix,
+                point_and_tangent,
+                timestep,
+                i,
+            )
+            Atv.append(Ai)
+            Btv.append(Bi)
+            Ctv.append(Ci)
+            index_used_list.append(index_selected)
+        return Atv, Btv, Ctv, index_used_list
+    
+    def set_track(self, track):
+        self.track = track
+        self.lap_length = track.lap_length
+        self.point_and_tangent = track.point_and_tangent
+        self.lap_width = track.width
+    
     def target_angular_callback(self,data):
         self.target_angular_z=data
         self.vehicles_interest['target_1'].xglob[2]=self.target_angular_z
@@ -101,7 +215,7 @@ class Overtaking_algorithm():
         self.target_orientation_w=data.orientation.w 
         self.target_s,self.target_d = self.get_frenet(self.target_x, self.target_y,self.waypoint)
         self.target_yaw = self.get_yaw_from_orientation(self.target_orientation_x, self.target_orientation_y, self.target_orientation_z, self.target_orientation_w)
-        path_yaw = self.get_path_yaw(self.waypoint)
+        path_yaw = self.get_path_yaw(self.waypoint,self.target_x,self.target_y)
         epsi = self.target_yaw - path_yaw
         self.vehicles_interest['target_1'].xglob[3]=self.target_yaw
         self.vehicles_interest['target_1'].xglob[4]=self.target_x
@@ -124,7 +238,7 @@ class Overtaking_algorithm():
         self.x[5]=self.current_d
         
         yaw = self.get_yaw_from_orientation(self.current_orientation_x, self.current_orientation_y, self.current_orientation_z, self.current_orientation_w)
-        path_yaw = self.get_path_yaw(self.waypoint)
+        path_yaw = self.get_path_yaw(self.waypoint,self.current_x,self.current_y)
         epsi = yaw - path_yaw
         self.x[3] = epsi 
         self.vehicles_interest['ego'].xglob[3]=yaw
@@ -135,8 +249,8 @@ class Overtaking_algorithm():
         self.vehicles_interest['ego'].xcurv[5]=self.x[5]
         
     
-    def get_path_yaw(self, waypoints):
-        closest_wp_index = self.get_closest_waypoint(self.current_x, self.current_y, waypoints)
+    def get_path_yaw(self, waypoints,x,y):
+        closest_wp_index = self.get_closest_waypoint(self.current_x, x,y)
         next_wp_index = (closest_wp_index + 1) % len(waypoints)
         dx = waypoints[next_wp_index][0] - waypoints[closest_wp_index][0]
         dy = waypoints[next_wp_index][1] - waypoints[closest_wp_index][1]
